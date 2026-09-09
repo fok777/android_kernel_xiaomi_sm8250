@@ -8,13 +8,95 @@ on:
         required: true
         type: boolean
         default: true
+      clean_before:
+        description: 'Delete previous caches / artifacts / release before build (构建前清理旧数据)'
+        required: true
+        type: boolean
+        default: true
+      release_tag:
+        description: 'Release tag (fixed tag = overwrite each build, 固定 tag 即每次覆盖)'
+        required: false
+        type: string
+        default: 'latest'
 
 permissions:
   contents: write
+  actions: write
 
 jobs:
+  cleanup:
+    name: Clean previous caches / artifacts / release
+    if: ${{ github.event.inputs.clean_before == 'true' || github.event.inputs.clean_before == true }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Delete all Actions caches
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "[*] Deleting all Actions caches..."
+          gh api --paginate "repos/${GITHUB_REPOSITORY}/actions/caches?per_page=100" \
+            --jq '.actions_caches[].id' > /tmp/cache_ids.txt 2>/dev/null || echo "" > /tmp/cache_ids.txt
+          TOTAL=0
+          while read -r id; do
+            [ -z "$id" ] && continue
+            if gh api -X DELETE "repos/${GITHUB_REPOSITORY}/actions/caches/${id}" >/dev/null 2>&1; then
+              TOTAL=$((TOTAL+1))
+            fi
+          done < /tmp/cache_ids.txt
+          echo "[+] Deleted $TOTAL caches."
+
+      - name: Delete all previous artifacts
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "[*] Deleting all previous artifacts..."
+          gh api --paginate "repos/${GITHUB_REPOSITORY}/actions/artifacts?per_page=100" \
+            --jq '.artifacts[].id' > /tmp/art_ids.txt 2>/dev/null || echo "" > /tmp/art_ids.txt
+          TOTAL=0
+          while read -r id; do
+            [ -z "$id" ] && continue
+            if gh api -X DELETE "repos/${GITHUB_REPOSITORY}/actions/artifacts/${id}" >/dev/null 2>&1; then
+              TOTAL=$((TOTAL+1))
+            fi
+          done < /tmp/art_ids.txt
+          echo "[+] Deleted $TOTAL artifacts."
+
+      - name: Delete previous Release and tag
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.event.inputs.release_tag }}
+        run: |
+          echo "[*] Deleting previous release (tag: $TAG) if exists..."
+          REL_ID=$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}" --jq '.id' 2>/dev/null || echo "")
+          if [ -n "$REL_ID" ]; then
+            gh api -X DELETE "repos/${GITHUB_REPOSITORY}/releases/${REL_ID}" >/dev/null 2>&1 \
+              && echo "[+] Release '$TAG' deleted." || echo "[!] Failed to delete release."
+          else
+            echo "[=] No existing release with tag '$TAG'."
+          fi
+          gh api -X DELETE "repos/${GITHUB_REPOSITORY}/git/refs/tags/${TAG}" >/dev/null 2>&1 \
+            && echo "[+] Git tag '$TAG' deleted." || echo "[=] No git tag '$TAG' to delete."
+
+      - name: Delete previous workflow runs
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "[*] Deleting previous workflow runs..."
+          gh api --paginate "repos/${GITHUB_REPOSITORY}/actions/workflows/build_all.yml/runs?status=completed&per_page=100" \
+            --jq '.workflow_runs[].id' > /tmp/run_ids.txt 2>/dev/null || echo "" > /tmp/run_ids.txt
+          TOTAL=0
+          while read -r id; do
+            [ -z "$id" ] && continue
+            if gh api -X DELETE "repos/${GITHUB_REPOSITORY}/actions/runs/${id}" >/dev/null 2>&1; then
+              TOTAL=$((TOTAL+1))
+            fi
+          done < /tmp/run_ids.txt
+          echo "[+] Deleted $TOTAL old workflow runs."
+
   build-matrix:
     name: Build ${{ matrix.device }} | ${{ matrix.ksu && 'KSU' || 'NoKSU' }} (AOSP + MIUI)
+    needs: cleanup
+    if: ${{ always() }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -58,7 +140,7 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: ~/.cache/ccache_mikernel
-          key: ${{ runner.os }}-kernel-ccache-${{ matrix.device }}-${{ matrix.ksu && 'ksu' || 'noksu' }}-${{ github.run_id }}
+          key: ${{ runner.os }}-kernel-ccache-${{ matrix.device }}-${{ matrix.ksu && 'ksu' || 'noksu' }}
           restore-keys: |
             ${{ runner.os }}-kernel-ccache-${{ matrix.device }}-${{ matrix.ksu && 'ksu' || 'noksu' }}-
             ${{ runner.os }}-kernel-ccache-${{ matrix.device }}-
@@ -74,25 +156,32 @@ jobs:
       - name: Run Build Script
         run: |
           chmod +x build_kernel.sh
-          
+
           ARGS="${{ matrix.device }}"
           if [ "${{ matrix.ksu }}" = "true" ]; then
             ARGS="$ARGS ksu"
           fi
-          
+
           echo "Executing command: ./build_kernel.sh $ARGS"
           ./build_kernel.sh $ARGS
+
+      - name: Save ccache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.cache/ccache_mikernel
+          key: ${{ runner.os }}-kernel-ccache-${{ matrix.device }}-${{ matrix.ksu && 'ksu' || 'noksu' }}-${{ github.run_id }}
 
       - name: Upload Kernel Artifacts
         uses: actions/upload-artifact@v4
         with:
           name: APTKernel-${{ matrix.device }}-${{ matrix.ksu && 'KSU' || 'NoKSU' }}-${{ github.run_id }}
           path: APTKernel_*.zip
-          compression-level: 0 # 内核刷机包本身已是 zip 格式，无需二次压缩
+          compression-level: 0
 
   release:
     name: Publish GitHub Release
-    if: ${{ github.event.inputs.publish_release == 'true' || github.event.inputs.publish_release == true }}
+    if: ${{ always() && (github.event.inputs.publish_release == 'true' || github.event.inputs.publish_release == true) }}
     needs: build-matrix
     runs-on: ubuntu-latest
     steps:
@@ -105,7 +194,7 @@ jobs:
         id: vars
         run: |
           echo "BUILD_DATE=$(date +'%Y%m%d')" >> $GITHUB_OUTPUT
-          echo "TAG_NAME=v$(date +'%Y%m%d')-${GITHUB_SHA::8}" >> $GITHUB_OUTPUT
+          echo "TAG_NAME=${{ github.event.inputs.release_tag }}" >> $GITHUB_OUTPUT
           echo "SHA_SHORT=${GITHUB_SHA::8}" >> $GITHUB_OUTPUT
 
       - name: Download All Artifacts
@@ -122,11 +211,13 @@ jobs:
           name: "APTKernel Build - ${{ steps.vars.outputs.BUILD_DATE }} (${{ steps.vars.outputs.SHA_SHORT }})"
           body: |
             ## 自动构建内核发布 / Automated Kernel Release
-            
+
             - **构建日期 / Build Date:** ${{ steps.vars.outputs.BUILD_DATE }}
             - **提交哈希 / Commit SHA:** `${{ steps.vars.outputs.SHA_SHORT }}`
             - **支持设备 / Supported Devices:** `alioth, apollo, cas, cmi, dagu, elish, enuma, lmi, munch, pipa, psyche, thyme, umi`
-            
+
+            > 此 Release 使用固定 tag `${{ steps.vars.outputs.TAG_NAME }}`，每次构建会覆盖上一次内容。
+
             ---
             ### 刷机包分类指南 / Flashable ZIP Instructions:
             - **MIUI**: 适用于原厂 MIUI / HyperOS 或基于 MIUI 修改的第三方 ROM。
