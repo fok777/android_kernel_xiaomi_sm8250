@@ -8,15 +8,6 @@
 #include <linux/cred.h>
 #endif
 
-#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 7, 0)
-#define d_in_lookup(dentry) (0)
-#define d_lookup_done(dentry) do {} while (0)
-#endif // to support 4.4 and older kernel
-
-#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 7, 0)
-#define GFP_KERNEL_ACCOUNT GFP_KERNEL
-#endif // to support 4.4 and older kernel
-
 /********/
 /* ENUM */
 /********/
@@ -56,6 +47,9 @@
 #define TRY_UMOUNT_DETACH 1 /* used by susfs_try_umount() */
 
 #define VFSMOUNT_MNT_FLAGS_KSU_UNSHARED_MNT 0x80000000 /* used for mounts that are unshared by ksu process */
+#define DEFAULT_SUS_MNT_ID 100000 /* used by mount->mnt_id for sus mounts */
+#define DEFAULT_SUS_MNT_ID_FOR_KSU_PROC_UNSHARE 1000000 /* used by vfsmount->susfs_mnt_id_backup */
+#define DEFAULT_SUS_MNT_GROUP_ID 1000 /* used by mount->mnt_group_id for sus mounts */
 #define DEFAULT_KSU_MNT_ID 2000000000 /* used for mounts created or single cloned by ksu process */
 #define DEFAULT_KSU_MNT_GROUP_ID 200000 /* used by mount->mnt_group_id */
 
@@ -63,16 +57,33 @@
 #define FUSE_SUPER_MAGIC 0x65735546
 #endif
 /*
- * inode->i_state => A 'unsigned long' type storing flag 'AS_FLAGS_', bit 1 to 31 is not usable since 6.12
+ * inode->i_state => storing flag 'INODE_STATE_' (for direct bitmask checks)
+ * inode->i_mapping->flags => storing flag 'AS_FLAGS_' (for test_bit checks)
  * nd->state => storing flag 'ND_STATE_'
  * nd->flags => storing flag 'ND_FLAGS_'
  * task_struct->thread_info.flags => storing flag 'TIF_'
+ * task_struct->susfs_task_state => storing flag 'TASK_STRUCT_'
  */
  // thread_info->flags is unsigned long :D
 #define TIF_PROC_UMOUNTED 33
+#ifdef CONFIG_64BIT
 #define TIF_PROC_NO_SU 34
 #define TIF_PROC_UMOUNTED_FOR_ZYGOTE_NEXT 35
+#else
+#define TIF_PROC_NO_SU 28
+#define TIF_PROC_UMOUNTED_FOR_ZYGOTE_NEXT 29
+#endif
 
+/* INODE_STATE_* flags for inode->i_state bitmask checks */
+#define INODE_STATE_SUS_PATH BIT(24)
+#define INODE_STATE_SUS_MOUNT BIT(25)
+#define INODE_STATE_SUS_KSTAT BIT(26)
+#define INODE_STATE_OPEN_REDIRECT BIT(27)
+
+/* TASK_STRUCT_* flags for task_struct->susfs_task_state bitmask checks */
+#define TASK_STRUCT_NON_ROOT_USER_APP_PROC BIT(24)
+
+/* AS_FLAGS_* flags for inode->i_mapping->flags (address_space) test_bit checks */
 #define AS_FLAGS_SUS_PATH 33
 #define AS_FLAGS_SUS_MOUNT 34
 #define AS_FLAGS_SUS_KSTAT 35
@@ -82,7 +93,7 @@
 #define ND_STATE_LOOKUP_LAST 32
 #define ND_STATE_OPEN_LAST 64
 #define ND_FLAGS_LOOKUP_LAST		0x2000000
- 
+
 #define MAGIC_MOUNT_WORKDIR "/debug_ramdisk/workdir"
 
 
@@ -175,11 +186,7 @@ static inline void susfs_clear_current_proc_umounted_for_zygote_next(void) {
 
 static inline bool susfs_is_current_proc_umounted_app(void) {
 	return (likely(test_thread_flag(TIF_PROC_UMOUNTED)) &&
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 12, 0)
-			__kuid_val(current_uid()) >= 10000);
-#else
 			current_uid().val >= 10000);
-#endif
 }
 
 static inline bool susfs_is_current_proc_no_su(void) {
